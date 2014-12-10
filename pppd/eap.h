@@ -110,8 +110,8 @@ enum eap_state_code {
 	"SRP1", "SRP2", "SRP3", "MD5Chall", "Open", "SRP4", "BadAuth"
 
 #ifdef USE_EAPTLS
-#define	eap_client_active(esp)	((esp)->es_client.ea_state != eapInitial ||\
-				 (esp)->es_client.ea_state != eapPending ||\
+#define	eap_client_active(esp)	((esp)->es_client.ea_state != eapInitial &&\
+				 (esp)->es_client.ea_state != eapPending &&\
 				 (esp)->es_client.ea_state != eapClosed)
 #else
 #define eap_client_active(esp)	((esp)->es_client.ea_state == eapListen)
