@@ -55,6 +55,58 @@ static ENGINE *pkey_engine = NULL;
 
 #ifdef MPPE
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+
+/*
+ * https://wiki.openssl.org/index.php/1.1_API_Changes
+ * tries to provide some guidance but ultimately falls short.
+ */
+
+static void HMAC_CTX_free(HMAC_CTX *ctx)
+{
+	if (ctx != NULL) {
+		HMAC_CTX_cleanup(ctx);
+		OPENSSL_free(ctx);
+	}
+}
+
+static HMAC_CTX *HMAC_CTX_new(void)
+{
+	HMAC_CTX *ctx = OPENSSL_malloc(sizeof(*ctx));
+	if (ctx != NULL)
+		HMAC_CTX_init(ctx);
+	return ctx;
+}
+
+/*
+ * These were basically jacked directly from the OpenSSL tree
+ * without adjustments.
+ */
+
+static size_t SSL_get_client_random(const SSL *ssl, unsigned char *out,
+				    size_t outlen)
+{
+	if (outlen == 0)
+		return sizeof(ssl->s3->client_random);
+	if (outlen > sizeof(ssl->s3->client_random))
+		outlen = sizeof(ssl->s3->client_random);
+	memcpy(out, ssl->s3->client_random, outlen);
+	return outlen;
+}
+
+static size_t SSL_SESSION_get_master_key(const SSL_SESSION *session,
+				         unsigned char *out, size_t outlen)
+{
+	if (outlen == 0)
+		return session->master_key_length;
+	if (outlen > session->master_key_length)
+		outlen = session->master_key_length;
+	memcpy(out, session->master_key, outlen);
+	return outlen;
+}
+
+#endif /* OPENSSL_VERSION_NUMBER < 0x10100000L */
+
 /*
  * TLS PRF from RFC 2246
  */
@@ -63,47 +115,47 @@ static void P_hash(const EVP_MD *evp_md,
 		   const unsigned char *seed,   unsigned int seed_len,
 		   unsigned char *out, unsigned int out_len)
 {
-	HMAC_CTX ctx_a, ctx_out;
+	HMAC_CTX *ctx_a, *ctx_out;
 	unsigned char a[HMAC_MAX_MD_CBLOCK];
 	unsigned int size;
 
-	HMAC_CTX_init(&ctx_a);
-	HMAC_CTX_init(&ctx_out);
-	HMAC_Init_ex(&ctx_a, secret, secret_len, evp_md, NULL);
-	HMAC_Init_ex(&ctx_out, secret, secret_len, evp_md, NULL);
+	ctx_a = HMAC_CTX_new();
+	ctx_out = HMAC_CTX_new();
+	HMAC_Init_ex(ctx_a, secret, secret_len, evp_md, NULL);
+	HMAC_Init_ex(ctx_out, secret, secret_len, evp_md, NULL);
 
-	size = HMAC_size(&ctx_out);
+	size = HMAC_size(ctx_out);
 
 	/* Calculate A(1) */
-	HMAC_Update(&ctx_a, seed, seed_len);
-	HMAC_Final(&ctx_a, a, NULL);
+	HMAC_Update(ctx_a, seed, seed_len);
+	HMAC_Final(ctx_a, a, NULL);
 
 	while (1) {
 		/* Calculate next part of output */
-		HMAC_Update(&ctx_out, a, size);
-		HMAC_Update(&ctx_out, seed, seed_len);
+		HMAC_Update(ctx_out, a, size);
+		HMAC_Update(ctx_out, seed, seed_len);
 
 		/* Check if last part */
 		if (out_len < size) {
-			HMAC_Final(&ctx_out, a, NULL);
+			HMAC_Final(ctx_out, a, NULL);
 			memcpy(out, a, out_len);
 			break;
 		}
 
 		/* Place digest in output buffer */
-		HMAC_Final(&ctx_out, out, NULL);
-		HMAC_Init_ex(&ctx_out, NULL, 0, NULL, NULL);
+		HMAC_Final(ctx_out, out, NULL);
+		HMAC_Init_ex(ctx_out, NULL, 0, NULL, NULL);
 		out += size;
 		out_len -= size;
 
 		/* Calculate next A(i) */
-		HMAC_Init_ex(&ctx_a, NULL, 0, NULL, NULL);
-		HMAC_Update(&ctx_a, a, size);
-		HMAC_Final(&ctx_a, a, NULL);
+		HMAC_Init_ex(ctx_a, NULL, 0, NULL, NULL);
+		HMAC_Update(ctx_a, a, size);
+		HMAC_Final(ctx_a, a, NULL);
 	}
 
-	HMAC_CTX_cleanup(&ctx_a);
-	HMAC_CTX_cleanup(&ctx_out);
+	HMAC_CTX_free(ctx_a);
+	HMAC_CTX_free(ctx_out);
 	memset(a, 0, sizeof(a));
 }
 
@@ -137,21 +189,22 @@ void eaptls_gen_mppe_keys(struct eaptls_session *ets, const char *prf_label,
     unsigned char *p = seed;
 	SSL			  *s = ets->ssl;
     size_t prf_size;
+    unsigned char master_key[SSL_MAX_MASTER_KEY_LENGTH];
+    size_t master_key_length;
 
     prf_size = strlen(prf_label);
 
     memcpy(p, prf_label, prf_size);
     p += prf_size;
 
-    memcpy(p, s->s3->client_random, SSL3_RANDOM_SIZE);
+    prf_size += SSL_get_client_random(s, p, SSL3_RANDOM_SIZE);
     p += SSL3_RANDOM_SIZE;
-    prf_size += SSL3_RANDOM_SIZE;
 
-    memcpy(p, s->s3->server_random, SSL3_RANDOM_SIZE);
-    prf_size += SSL3_RANDOM_SIZE;
+    prf_size += SSL_get_client_random(s, p, SSL3_RANDOM_SIZE);
 
-    PRF(s->session->master_key, s->session->master_key_length,
-        seed, prf_size, out, buf, sizeof(out));
+    master_key_length = SSL_SESSION_get_master_key(SSL_get_session(s), master_key,
+						   sizeof(master_key));
+    PRF(master_key, master_key_length, seed, prf_size, out, buf, sizeof(out));
 
     /* 
      * We now have the master send and receive keys.
